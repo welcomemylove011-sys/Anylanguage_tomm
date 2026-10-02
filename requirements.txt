@@ -1,0 +1,8 @@
+fastapi>=0.115,<1
+uvicorn[standard]>=0.30,<1
+python-multipart>=0.0.9,<1
+requests>=2.32,<3
+yt-dlp[default,curl-cffi]
+curl-cffi
+bgutil-ytdlp-pot-provider
+git+https://github.com/tribixbite/yt-dlp-threads.git

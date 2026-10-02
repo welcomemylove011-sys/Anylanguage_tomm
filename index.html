@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="my">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>The Quick Plot — AI Video Translator</title><link rel="stylesheet" href="/static/style.css"></head>
+<body><main class="shell">
+<header><div class="brand"><span class="logo">✦</span><div><h1>The Quick Plot</h1><p>AI Video Translation Studio</p></div></div><span id="health" class="pill">Checking AI…</span></header>
+<section class="hero"><span class="eyebrow">ANY LANGUAGE → MYANMAR</span><h2>ဘယ်ဘာသာနဲ့ပြောထားထား မြန်မာလို လူပြောသလို ပြန်ပေးမယ်</h2><p>Auto language detection → natural Myanmar translation → conversational Myanmar voice → subtitles → colour grading → final MP4.</p></section>
+<section class="card">
+<div class="inputTabs">
+<button type="button" id="uploadTab" class="tab active">📁 Upload Video</button>
+<button type="button" id="linkTab" class="tab">🔗 Paste Video Link</button>
+</div>
+<div id="uploadPane">
+<label class="drop"><input id="video" type="file" accept="video/*"><div class="upload-icon">🎬</div><h3>Video Upload</h3><p>MP4, MOV, MKV, WEBM</p><span class="choose">Choose Video</span></label>
+</div>
+<div id="linkPane" class="linkPane hidden">
+<label>Video URL</label>
+<div class="urlRow"><input id="videoUrl" class="textInput" type="url" placeholder="Paste YouTube / Facebook / TikTok / Threads link…"><button type="button" id="useLink" class="smallBtn">Use Link</button></div>
+<p class="hint">Public video links ကို အသုံးပြုပါ။ Private/login-only videos များကို platform က download ခွင့်မပြုနိုင်ပါ။</p>
+</div>
+<div id="previewWrap" class="preview hidden"><div class="previewStage"><video id="preview" controls></video><div id="subtitlePreview">မြန်မာစာတန်းကို ဒီနေရာမှာ ပြမယ်</div></div><div id="fileName"></div></div>
+
+<div class="sectionTitle"><span class="eyebrow">LANGUAGE</span><h3>Auto Detect</h3><p>Original video ဘာသာစကားကို AI က အလိုအလျောက်သိပြီး မြန်မာလို ပြန်ပေးမယ်။</p></div>
+<div class="languageBox"><span>🎙️ Source</span><b>Auto Detect</b><span class="arrow">→</span><span>🇲🇲 Target</span><b>Myanmar</b></div>
+
+<div class="voicePanel"><div class="panelTitle"><div><span class="eyebrow">GEMINI VOICE LIBRARY</span><h3>AI Voice</h3></div><span id="voiceCount" class="smallPill">Loading…</span></div>
+<input id="voiceSearch" class="search" placeholder="Search voice: warm, narrator, friendly…"><select id="voice"></select></div>
+
+<div class="controls">
+<div><label>Speaking style</label><select id="style"><option value="natural">Natural — လူပြောသလို</option><option value="narrator">Documentary Narrator</option><option value="friendly">Friendly & Warm</option><option value="news">News Presenter</option><option value="story">Expressive Storyteller</option><option value="calm">Calm & Gentle</option><option value="energetic">Energetic</option></select></div>
+<div><label>Custom direction <span class="mutedInline">optional</span></label><input id="customStyle" class="textInput" placeholder="e.g. natural Burmese, warm, slightly slow"></div>
+</div>
+<div class="hint">Myanmar speech ကို formal “သည်/မည်” မဟုတ်ဘဲ conversational “တယ်/မယ်/ပါတယ်” ပုံစံကို ဦးစားပေးထားပါတယ်။</div>
+
+<div class="sectionTitle"><span class="eyebrow">SUBTITLES</span><h3>Original / Myanmar subtitles</h3></div>
+<div class="optionGrid">
+<label class="choice"><input type="radio" name="subtitle" value="myanmar" checked><span><b>Myanmar subtitle</b><small>မြန်မာစာကို video ပေါ်မှာ burn-in လုပ်မယ်</small></span></label>
+<label class="choice"><input type="radio" name="subtitle" value="keep"><span><b>Keep original track</b><small>Soft subtitle track ရှိရင် ဆက်ထည့်မယ်</small></span></label>
+<label class="choice"><input type="radio" name="subtitle" value="remove"><span><b>Remove original track</b><small>Original soft subtitle track မထည့်ဘူး</small></span></label>
+</div>
+<div class="hint">မှတ်ချက် — original subtitle က video pixels ထဲ hardcoded/burned-in ဖြစ်ပြီးသားဆို cleanly ဖျောက်လို့မရပါ။</div>
+
+<div class="sectionTitle"><span class="eyebrow">SUBTITLE EDITOR</span><h3>မြန်မာစာတန်းကို လွတ်လွတ်လပ်လပ် ချိန်ညှိပါ</h3><p>Preview ထဲက စာတန်းကို drag လုပ်ပြီး နေရာရွှေ့နိုင်ပါတယ်။</p></div>
+<div class="subtitleEditor">
+<div class="editorPreview"><div class="editorStage"><div id="editorText">မြန်မာစာတန်း Preview</div></div><small>Drag the subtitle ↔</small></div>
+<div class="editorControls">
+<div class="sliderBox"><label>Position X <output id="subtitleXOut">50%</output></label><input id="subtitleX" type="range" min="0" max="100" value="50"></div>
+<div class="sliderBox"><label>Position Y <output id="subtitleYOut">88%</output></label><input id="subtitleY" type="range" min="0" max="100" value="88"></div>
+<div class="sliderBox"><label>Font Size <output id="subtitleFontOut">52</output></label><input id="subtitleFont" type="range" min="16" max="120" value="52"></div>
+<div class="sliderBox"><label>Scale X <output id="subtitleScaleXOut">100%</output></label><input id="subtitleScaleX" type="range" min="50" max="180" value="100"></div>
+<div class="sliderBox"><label>Scale Y <output id="subtitleScaleYOut">100%</output></label><input id="subtitleScaleY" type="range" min="50" max="180" value="100"></div>
+<div><label>Alignment</label><select id="subtitleAlignment" class="textInput"><option value="1">↙ Bottom Left</option><option value="2" selected>↓ Bottom Center</option><option value="3">↘ Bottom Right</option><option value="4">← Middle Left</option><option value="5">Center</option><option value="6">→ Middle Right</option><option value="7">↖ Top Left</option><option value="8">↑ Top Center</option><option value="9">↗ Top Right</option></select></div>
+<div class="colorLine"><label>Text Color</label><input id="subtitleColor" type="color" value="#FFFFFF"></div>
+<div class="colorLine"><label>Outline Color</label><input id="subtitleOutlineColor" type="color" value="#000000"></div>
+<div class="sliderBox"><label>Outline Width <output id="subtitleOutlineOut">3</output></label><input id="subtitleOutline" type="range" min="0" max="12" step="0.5" value="3"></div>
+<div class="sliderBox"><label>Shadow <output id="subtitleShadowOut">1</output></label><input id="subtitleShadow" type="range" min="0" max="8" step="0.5" value="1"></div>
+<div class="colorLine"><label>Background</label><input id="subtitleBackground" type="checkbox" checked><input id="subtitleBgColor" type="color" value="#000000"></div>
+<div class="sliderBox"><label>Background Opacity <output id="subtitleBgOpacityOut">55%</output></label><input id="subtitleBgOpacity" type="range" min="0" max="100" value="55"></div>
+<button type="button" id="subtitleReset" class="resetBtn">↺ Reset Subtitle</button>
+</div></div>
+
+<div class="sectionTitle"><span class="eyebrow">BACKGROUND MUSIC</span><h3>Original Music Library</h3><p>Video ရဲ့ voice ကို မဖုံးအောင် background music ကို နိမ့်နိမ့် mix လုပ်ပေးမယ်။ ဒီ library ထဲက tracks တွေကို The Quick Plot အတွက် original procedural audio အဖြစ်ဖန်တီးထားပါတယ်။</p></div>
+<div class="controls musicControls">
+<div><label>Music</label><select id="musicTrack" class="textInput"><option value="none">No background music</option><option value="piano">🎹 Original Soft Piano</option><option value="guitar">🎸 Original Acoustic Guitar</option><option value="dj">🎧 Original DJ Chill Beat</option></select></div>
+<div class="sliderBox"><label>Music Volume <output id="musicVolumeOut">12%</output></label><input id="musicVolume" type="range" min="0" max="35" step="1" value="12"></div>
+</div>
+<div class="musicNote">✓ Built-in original tracks — external music files မသုံးထားပါ။</div>
+
+<div class="sectionTitle"><span class="eyebrow">AI THUMBNAIL</span><h3>Video နဲ့ကိုက်တဲ့ Thumbnail ကို တခါတည်း Generate</h3><p>Video content ကို Gemini AI ကကြည့်ပြီး 16:9 YouTube-style thumbnail တစ်ခု generate ပေးမယ်။</p></div>
+<label class="thumbToggle"><input id="autoThumbnail" type="checkbox" checked><span><b>Auto-generate thumbnail</b><small>Video ပြီးတာနဲ့ thumbnail ကို အလိုအလျောက်ထုတ်ပေးမယ်</small></span></label>
+
+<div class="sectionTitle"><span class="eyebrow">COLOUR GRADING</span><h3>Video Look</h3></div>
+<div class="controls"><div><label>Preset</label><select id="colorPreset"><option value="original">Original</option><option value="cinematic">Cinematic</option><option value="warm">Warm</option><option value="cool">Cool</option><option value="bright">Bright</option><option value="dark">Dark</option><option value="vivid">Vivid</option></select></div><div class="sliderBox"><label>Brightness <output id="brightnessOut">0</output></label><input id="brightness" type="range" min="-0.2" max="0.2" step="0.01" value="0"></div></div>
+<div class="sliderRow"><div class="sliderBox"><label>Contrast <output id="contrastOut">1.00</output></label><input id="contrast" type="range" min="0.7" max="1.5" step="0.01" value="1"></div><div class="sliderBox"><label>Saturation <output id="saturationOut">1.00</output></label><input id="saturation" type="range" min="0.5" max="1.6" step="0.01" value="1"></div></div>
+
+<button id="start" class="mainBtn" disabled>🚀 Translate & Generate Video</button>
+<div id="progress" class="hidden"><div class="bar"><span id="bar"></span></div><div class="status"><span id="status">Preparing…</span><b id="percent">0%</b></div></div>
+</section>
+
+<section id="result" class="card hidden"><div class="resultHead"><div><span class="eyebrow">FINAL RESULT</span><h2>မြန်မာဘာသာပြန် Video</h2></div><a id="download" class="download" download="the-quick-plot-myanmar.mp4">⬇ Download MP4</a></div>
+<video id="finalVideo" controls></video><div id="thumbResult" class="thumbResult hidden"><div><span class="eyebrow">AI THUMBNAIL</span><h3>Generated Thumbnail</h3></div><img id="thumbnailImage" alt="AI generated video thumbnail"><a id="thumbnailDownload" class="download" download="the-quick-plot-thumbnail.jpg">⬇ Download Thumbnail</a></div><div class="columns"><div><h3>Original Transcript</h3><pre id="transcript"></pre></div><div><h3>Myanmar Translation</h3><pre id="translation"></pre></div></div></section>
+<section id="error" class="error hidden"></section><footer>AI processing runs securely on the Space server. API keys stay in Space Secrets.</footer>
+</main><script src="/static/script.js"></script></body></html>
