@@ -1,476 +1,1115 @@
-import os, re, json, uuid, shutil, subprocess, tempfile, time
+import os
+import re
+import uuid
+import shutil
+import subprocess
 from pathlib import Path
 from urllib.parse import urlparse
 
 import gradio as gr
 import requests
 import yt_dlp
+from faster_whisper import WhisperModel
+
+
+# =========================================================
+# CONFIG
+# =========================================================
 
 OUTPUT_DIR = Path(os.getenv("OUTPUT_DIR", "outputs"))
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 
-MAX_MINUTES = int(os.getenv("MAX_VIDEO_MINUTES", "15"))
-TRANSCRIBE_MODEL = os.getenv("TRANSCRIBE_MODEL", "whisper-1")
-TEXT_MODEL = os.getenv("TEXT_MODEL", "gpt-4.1-mini")
-TTS_MODEL = os.getenv("TTS_MODEL", "gpt-4o-mini-tts")
-TTS_VOICE = os.getenv("TTS_VOICE", "alloy")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY", "").strip()
 
+WHISPER_MODEL = os.getenv("WHISPER_MODEL", "base")
+WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "cpu")
+WHISPER_COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "int8")
+
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+
+ELEVENLABS_MODEL = os.getenv(
+    "ELEVENLABS_MODEL",
+    "eleven_multilingual_v2"
+)
+
+ELEVENLABS_VOICE_ID = os.getenv(
+    "ELEVENLABS_VOICE_ID",
+    ""
+).strip()
+
+MAX_MINUTES = int(
+    os.getenv("MAX_VIDEO_MINUTES", "15")
+)
+
+WHISPER = None
+ELEVEN_VOICE_CACHE = None
+
+
+# =========================================================
+# SYSTEM
+# =========================================================
 
 def run_cmd(cmd):
-    p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    p = subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True
+    )
+
     if p.returncode != 0:
-        raise RuntimeError(p.stderr[-4000:] or "Command failed")
-    return p.stdout.strip()
+        raise RuntimeError(
+            p.stderr[-5000:] or "Command failed"
+        )
+
+    return p.stdout
 
 
-def ffmpeg_exists():
-    return shutil.which("ffmpeg") is not None
+def check_tools():
+    for name in ("ffmpeg", "ffprobe"):
+        if shutil.which(name) is None:
+            raise RuntimeError(
+                f"{name} မတွေ့ပါ။ FFmpeg install လုပ်ပါ။"
+            )
 
 
-def duration_seconds(path):
-    out = run_cmd([
-        "ffprobe", "-v", "error", "-show_entries", "format=duration",
-        "-of", "default=noprint_wrappers=1:nokey=1", str(path)
+def media_duration(path):
+    result = run_cmd([
+        "ffprobe",
+        "-v", "error",
+        "-show_entries", "format=duration",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        str(path)
     ])
-    return float(out)
+
+    return float(result.strip())
 
 
-def safe_name(text):
-    text = re.sub(r"[^a-zA-Z0-9_-]+", "_", text or "video")
-    return text.strip("_")[:60] or "video"
+# =========================================================
+# VIDEO DOWNLOAD
+# =========================================================
 
+def download_video(url, job, progress=None):
 
-def get_video_path(value):
-    if not value:
-        return None
-    if isinstance(value, dict):
-        return value.get("path") or value.get("name")
-    return str(value)
+    url = (url or "").strip()
 
+    parsed = urlparse(url)
 
-def platform_name(url):
-    host = urlparse(url).netloc.lower().replace("www.", "")
-    if "youtube.com" in host or host == "youtu.be":
-        return "YouTube"
-    if "facebook.com" in host or "fb.watch" in host:
-        return "Facebook"
-    if "tiktok.com" in host:
-        return "TikTok"
-    if "threads.net" in host or "threads.com" in host:
-        return "Threads"
-    return host or "Unknown"
+    if parsed.scheme not in ("http", "https"):
+        raise RuntimeError(
+            "မှန်ကန်တဲ့ public video URL ထည့်ပါ။"
+        )
 
+    output_template = str(
+        job / "source.%(ext)s"
+    )
 
-def download_video(url, job):
-    if not url or not url.strip():
-        raise ValueError("Video URL ထည့်ပါ။")
-    url = url.strip()
-    p = urlparse(url)
-    if p.scheme not in ("http", "https"):
-        raise ValueError("မှန်ကန်တဲ့ http/https video URL ထည့်ပါ။")
+    options = {
+        "outtmpl": output_template,
 
-    outtmpl = str(job / "downloaded.%(ext)s")
-    opts = {
-        "format": "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b",
-        "outtmpl": outtmpl,
-        "noplaylist": True,
+        "format":
+            "bv*[ext=mp4]+ba[ext=m4a]/"
+            "b[ext=mp4]/b",
+
         "merge_output_format": "mp4",
+
+        "noplaylist": True,
+
+        "retries": 3,
+
+        "fragment_retries": 3,
+
         "quiet": True,
+
         "no_warnings": True,
-        "restrictfilenames": True,
-        "retries": 2,
-        "fragment_retries": 2,
     }
+
+    if progress:
+        progress(
+            0.07,
+            "⬇️ Video download လုပ်နေပါတယ်..."
+        )
+
     try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            if info and info.get("duration") and info["duration"] > MAX_MINUTES * 60:
-                raise ValueError(f"Video အရှည်က {MAX_MINUTES} မိနစ်ထက်ပိုနေပါတယ်။")
+        with yt_dlp.YoutubeDL(options) as ydl:
+            ydl.download([url])
+
     except Exception as e:
-        msg = str(e)
-        if "Sign in to confirm" in msg or "not a bot" in msg.lower():
-            raise RuntimeError(
-                "ဒီ video site က downloader ကို anti-bot/authentication နဲ့ တားထားပါတယ်။ "
-                "Public video တစ်ခုနဲ့ စမ်းပါ။ Login/cookie bypass မလုပ်ထားပါ။"
-            )
-        if "Unsupported URL" in msg or "No video formats found" in msg:
-            raise RuntimeError(
-                f"{platform_name(url)} URL ကို downloader က မထောက်ပံ့နိုင်သေးပါ။ "
-                "Video ကို upload နည်းနဲ့ တိုက်ရိုက်တင်ပြီး ဆက်လုပ်နိုင်ပါတယ်။"
-            )
-        raise RuntimeError(f"Video download မအောင်မြင်ပါ: {msg[-1200:]}")
+        raise RuntimeError(
+            f"Video download မအောင်မြင်ပါ:\n{e}"
+        )
 
-    candidates = list(job.glob("downloaded.*"))
-    candidates = [p for p in candidates if p.suffix.lower() not in (".part", ".ytdl")]
-    if not candidates:
-        raise RuntimeError("Download ပြီးပေမယ့် video file မတွေ့ပါ။")
-    return max(candidates, key=lambda x: x.stat().st_size)
+    files = sorted(
+        job.glob("source.*")
+    )
 
+    if not files:
+        raise RuntimeError(
+            "Downloaded video file မတွေ့ပါ။"
+        )
+
+    return files[0]
+
+
+# =========================================================
+# AUDIO
+# =========================================================
 
 def extract_audio(video, job):
-    audio = job / "audio.mp3"
+
+    audio = job / "audio.wav"
+
     run_cmd([
-        "ffmpeg", "-y", "-i", str(video), "-vn", "-ac", "1", "-ar", "16000",
-        "-b:a", "64k", str(audio)
+        "ffmpeg",
+        "-y",
+        "-i", str(video),
+        "-vn",
+        "-ac", "1",
+        "-ar", "16000",
+        "-c:a", "pcm_s16le",
+        str(audio)
     ])
+
     return audio
 
 
-def split_audio(audio, job):
-    parts_dir = job / "chunks"
-    parts_dir.mkdir(exist_ok=True)
-    run_cmd([
-        "ffmpeg", "-y", "-i", str(audio), "-f", "segment", "-segment_time", "600",
-        "-reset_timestamps", "1", "-ac", "1", "-ar", "16000", "-b:a", "64k",
-        str(parts_dir / "chunk_%03d.mp3")
-    ])
-    return sorted(parts_dir.glob("chunk_*.mp3"))
+# =========================================================
+# FASTER WHISPER
+# =========================================================
 
+def get_whisper():
 
-def openai_post(path, data=None, files=None, timeout=300):
-    if not OPENAI_API_KEY:
-        raise RuntimeError("OPENAI_API_KEY မတွေ့ပါ။ GitHub Codespaces Secret ကို စစ်ပါ။")
-    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
-    r = requests.post(path, headers=headers, data=data, files=files, timeout=timeout)
-    if r.status_code >= 400:
-        try:
-            detail = r.json().get("error", {}).get("message", r.text)
-        except Exception:
-            detail = r.text
-        raise RuntimeError(f"OpenAI API error {r.status_code}: {detail}")
-    return r
+    global WHISPER
 
+    if WHISPER is None:
 
-def transcribe_chunk(chunk, offset, progress=None):
-    with open(chunk, "rb") as f:
-        r = openai_post(
-            "https://api.openai.com/v1/audio/transcriptions",
-            data={"model": TRANSCRIBE_MODEL, "response_format": "verbose_json"},
-            files={"file": (chunk.name, f, "audio/mpeg")},
-            timeout=600,
+        WHISPER = WhisperModel(
+            WHISPER_MODEL,
+            device=WHISPER_DEVICE,
+            compute_type=WHISPER_COMPUTE_TYPE
         )
-    data = r.json()
-    result = []
-    for s in data.get("segments", []) or []:
-        text = (s.get("text") or "").strip()
-        if not text:
-            continue
-        result.append({
-            "start": float(s.get("start", 0)) + offset,
-            "end": float(s.get("end", 0)) + offset,
-            "text": text,
-        })
-    if not result and data.get("text"):
-        result.append({"start": offset, "end": offset + 1.0, "text": data["text"].strip()})
-    return result
+
+    return WHISPER
 
 
-def transcribe(audio, job, progress=None):
-    chunks = split_audio(audio, job)
-    all_segments = []
-    for i, chunk in enumerate(chunks):
-        if progress:
-            progress(0.22 + 0.18 * (i / max(1, len(chunks))), f"🎧 Speech recognition {i+1}/{len(chunks)}")
-        all_segments.extend(transcribe_chunk(chunk, i * 600.0))
-    all_segments.sort(key=lambda x: x["start"])
-    return merge_segments(all_segments)
+def merge_segments(items):
 
+    if not items:
+        return []
 
-def merge_segments(segments):
-    merged = []
-    for s in segments:
-        if s["end"] <= s["start"] or not s["text"].strip():
-            continue
-        if merged:
-            prev = merged[-1]
-            gap = s["start"] - prev["end"]
-            combined_duration = s["end"] - prev["start"]
-            # Fewer TTS calls while keeping reasonably close timing.
-            if gap < 0.55 and combined_duration <= 9.0:
-                prev["text"] += " " + s["text"]
-                prev["end"] = s["end"]
-                continue
-        merged.append(dict(s))
+    merged = [
+        dict(items[0])
+    ]
+
+    for current in items[1:]:
+
+        previous = merged[-1]
+
+        gap = (
+            current["start"]
+            - previous["end"]
+        )
+
+        combined_duration = (
+            current["end"]
+            - previous["start"]
+        )
+
+        if (
+            gap <= 0.55
+            and combined_duration <= 9
+        ):
+
+            previous["end"] = current["end"]
+
+            previous["text"] = (
+                previous["text"]
+                + " "
+                + current["text"]
+            ).strip()
+
+        else:
+
+            merged.append(
+                dict(current)
+            )
+
     return merged
 
 
-def response_text(prompt):
-    payload = {
-        "model": TEXT_MODEL,
-        "input": prompt,
-        "max_output_tokens": 4000,
-    }
-    r = openai_post("https://api.openai.com/v1/responses", data={"model": TEXT_MODEL, "input": prompt, "max_output_tokens": 4000}, timeout=300)
-    data = r.json()
-    if data.get("output_text"):
-        return data["output_text"].strip()
-    pieces = []
-    for item in data.get("output", []) or []:
-        for c in item.get("content", []) or []:
-            if c.get("type") == "output_text" and c.get("text"):
-                pieces.append(c["text"])
-    return "\n".join(pieces).strip()
+def transcribe(audio, progress=None):
+
+    if progress:
+        progress(
+            0.20,
+            f"🎧 Faster-Whisper {WHISPER_MODEL} loading..."
+        )
+
+    model = get_whisper()
+
+    segments, info = model.transcribe(
+        str(audio),
+        beam_size=5,
+        vad_filter=True,
+        condition_on_previous_text=True
+    )
+
+    items = []
+
+    for segment in segments:
+
+        text = (
+            segment.text or ""
+        ).strip()
+
+        if not text:
+            continue
+
+        items.append({
+            "start":
+                float(segment.start),
+
+            "end":
+                float(segment.end),
+
+            "text":
+                text
+        })
+
+    if not items:
+        raise RuntimeError(
+            "Video ထဲမှာ speech မတွေ့ပါ။"
+        )
+
+    detected_language = getattr(
+        info,
+        "language",
+        "unknown"
+    )
+
+    if progress:
+        progress(
+            0.38,
+            f"🎧 Transcription ပြီးပါပြီ — {detected_language}"
+        )
+
+    return merge_segments(items)
+
+
+# =========================================================
+# GEMINI TRANSLATION
+# =========================================================
+
+def gemini_generate(prompt):
+
+    if not GEMINI_API_KEY:
+        raise RuntimeError(
+            "GEMINI_API_KEY မတွေ့ပါ။"
+        )
+
+    models = [
+        GEMINI_MODEL,
+        "gemini-2.5-flash",
+        "gemini-2.0-flash",
+    ]
+
+    used = set()
+
+    for model in models:
+
+        if not model or model in used:
+            continue
+
+        used.add(model)
+
+        url = (
+            "https://generativelanguage.googleapis.com/"
+            f"v1beta/models/{model}:generateContent"
+        )
+
+        response = requests.post(
+            url,
+            params={
+                "key": GEMINI_API_KEY
+            },
+            json={
+                "contents": [
+                    {
+                        "parts": [
+                            {
+                                "text": prompt
+                            }
+                        ]
+                    }
+                ],
+                "generationConfig": {
+                    "temperature": 0.2
+                }
+            },
+            timeout=300
+        )
+
+        if response.status_code == 404:
+            continue
+
+        if response.status_code >= 400:
+
+            try:
+                detail = (
+                    response.json()
+                    .get("error", {})
+                    .get("message", response.text)
+                )
+            except Exception:
+                detail = response.text
+
+            raise RuntimeError(
+                f"Gemini API error "
+                f"{response.status_code}: {detail}"
+            )
+
+        data = response.json()
+
+        try:
+
+            parts = (
+                data["candidates"][0]
+                ["content"]["parts"]
+            )
+
+            result = "".join(
+                p.get("text", "")
+                for p in parts
+            ).strip()
+
+            if result:
+                return result
+
+        except Exception:
+            pass
+
+    raise RuntimeError(
+        "Gemini model ကို အသုံးပြုလို့မရပါ။"
+    )
 
 
 def translate_batch(items):
-    numbered = "\n".join(f"{i+1}. {x['text']}" for i, x in enumerate(items))
+
+    source = "\n".join(
+        f"{i + 1}. {item['text']}"
+        for i, item in enumerate(items)
+    )
+
     prompt = f"""
 You are a professional Burmese dubbing translator.
-Translate every numbered line below into natural spoken Burmese (မြန်မာစကားပြောပုံစံ).
+
+Translate every numbered line into natural,
+smooth spoken Burmese.
+
 Rules:
-- Preserve meaning, names, numbers and important details.
-- Do not summarize or omit lines.
-- Make it sound natural when spoken aloud.
-- Return exactly the same number of numbered lines, one translation per line.
-- Do not add commentary.
+- Preserve the original meaning.
+- Do not summarize.
+- Do not omit anything.
+- Keep names and numbers correct.
+- Make Burmese natural for voice dubbing.
+- Return exactly the same numbered lines.
+- Do not add explanations.
 
 SOURCE:
-{numbered}
+
+{source}
 """
-    text = response_text(prompt)
-    lines = []
-    for line in text.splitlines():
-        line = line.strip()
-        m = re.match(r"^(\d+)\s*[.)-]\s*(.*)$", line)
-        if m:
-            lines.append((int(m.group(1)), m.group(2).strip()))
-    if len(lines) == len(items):
-        mapping = {n: t for n, t in lines}
-        return [mapping.get(i + 1, items[i]["text"]) for i in range(len(items))]
 
-    # Fallback: one segment at a time if the model did not preserve numbering.
-    out = []
-    for x in items:
-        out.append(response_text(
-            "Translate the following sentence into natural spoken Burmese. "
-            "Return only the Burmese translation.\n\n" + x["text"]
-        ))
-    return out
-
-
-def translate_segments(segments, progress=None):
-    out = []
-    batch_size = 10
-    total = len(segments)
-    for start in range(0, total, batch_size):
-        batch = segments[start:start + batch_size]
-        translations = translate_batch(batch)
-        for s, t in zip(batch, translations):
-            item = dict(s)
-            item["translation"] = (t or s["text"]).strip()
-            out.append(item)
-        if progress:
-            progress(0.40 + 0.18 * (min(total, start + len(batch)) / max(1, total)), f"🌐 Burmese translation {min(total, start+len(batch))}/{total}")
-    return out
-
-
-def tts(text, out_path):
-    r = openai_post(
-        "https://api.openai.com/v1/audio/speech",
-        data={
-            "model": TTS_MODEL,
-            "voice": TTS_VOICE,
-            "input": text[:4000],
-            "response_format": "mp3",
-            "instructions": "Speak natural, clear Burmese in a warm conversational style.",
-        },
-        timeout=300,
+    result = gemini_generate(
+        prompt
     )
-    out_path.write_bytes(r.content)
-    return out_path
+
+    parsed = {}
+
+    for line in result.splitlines():
+
+        match = re.match(
+            r"^\s*(\d+)\s*[.)-]\s*(.*)$",
+            line.strip()
+        )
+
+        if match:
+
+            parsed[
+                int(match.group(1))
+            ] = match.group(2).strip()
+
+    if len(parsed) == len(items):
+
+        return [
+            parsed.get(
+                i + 1,
+                items[i]["text"]
+            )
+            for i in range(len(items))
+        ]
+
+    # Fallback
+    return [
+        gemini_generate(
+            "Translate this into natural spoken Burmese. "
+            "Return only the Burmese translation:\n\n"
+            + item["text"]
+        )
+        for item in items
+    ]
 
 
-def atempo_filter(factor):
-    # atempo accepts 0.5..2.0 per filter; chain when necessary.
-    factor = max(0.05, factor)
+def translate_segments(
+    segments,
+    progress=None
+):
+
+    result = []
+
+    total = len(segments)
+
+    batch_size = 10
+
+    for start in range(
+        0,
+        total,
+        batch_size
+    ):
+
+        batch = segments[
+            start:start + batch_size
+        ]
+
+        translations = translate_batch(
+            batch
+        )
+
+        for source, translated in zip(
+            batch,
+            translations
+        ):
+
+            item = dict(source)
+
+            item["translation"] = (
+                translated
+                or source["text"]
+            ).strip()
+
+            result.append(item)
+
+        done = min(
+            total,
+            start + len(batch)
+        )
+
+        if progress:
+
+            progress(
+                0.40
+                + (
+                    0.18
+                    * done
+                    / max(1, total)
+                ),
+                f"🌐 Burmese translation "
+                f"{done}/{total}"
+            )
+
+    return result
+
+
+# =========================================================
+# ELEVENLABS
+# =========================================================
+
+def get_eleven_voice_id():
+
+    global ELEVEN_VOICE_CACHE
+
+    if ELEVENLABS_VOICE_ID:
+        return ELEVENLABS_VOICE_ID
+
+    if ELEVEN_VOICE_CACHE:
+        return ELEVEN_VOICE_CACHE
+
+    response = requests.get(
+        "https://api.elevenlabs.io/v1/voices",
+        headers={
+            "xi-api-key":
+                ELEVENLABS_API_KEY
+        },
+        timeout=60
+    )
+
+    if response.status_code >= 400:
+
+        try:
+            detail = (
+                response.json()
+                .get("detail", response.text)
+            )
+        except Exception:
+            detail = response.text
+
+        raise RuntimeError(
+            f"ElevenLabs voices error "
+            f"{response.status_code}: {detail}"
+        )
+
+    voices = (
+        response.json()
+        .get("voices", [])
+    )
+
+    if not voices:
+        raise RuntimeError(
+            "ElevenLabs voice မတွေ့ပါ။"
+        )
+
+    # Prefer a voice supporting multilingual model
+    for voice in voices:
+
+        model_ids = (
+            voice.get(
+                "high_quality_base_model_ids",
+                []
+            )
+            or []
+        )
+
+        if ELEVENLABS_MODEL in model_ids:
+
+            ELEVEN_VOICE_CACHE = (
+                voice.get("voice_id")
+            )
+
+            if ELEVEN_VOICE_CACHE:
+                return ELEVEN_VOICE_CACHE
+
+    ELEVEN_VOICE_CACHE = (
+        voices[0].get("voice_id")
+    )
+
+    if not ELEVEN_VOICE_CACHE:
+        raise RuntimeError(
+            "ElevenLabs voice ID မတွေ့ပါ။"
+        )
+
+    return ELEVEN_VOICE_CACHE
+
+
+def elevenlabs_tts(
+    text,
+    output_file
+):
+
+    if not ELEVENLABS_API_KEY:
+        raise RuntimeError(
+            "ELEVENLABS_API_KEY မတွေ့ပါ။"
+        )
+
+    voice_id = (
+        get_eleven_voice_id()
+    )
+
+    response = requests.post(
+
+        f"https://api.elevenlabs.io/"
+        f"v1/text-to-speech/{voice_id}",
+
+        headers={
+            "xi-api-key":
+                ELEVENLABS_API_KEY,
+
+            "Accept":
+                "audio/mpeg",
+
+            "Content-Type":
+                "application/json"
+        },
+
+        json={
+            "text": text[:5000],
+
+            "model_id":
+                ELEVENLABS_MODEL,
+
+            "voice_settings": {
+                "stability": 0.5,
+
+                "similarity_boost":
+                    0.75,
+
+                "style": 0.0,
+
+                "use_speaker_boost":
+                    True
+            }
+        },
+
+        timeout=300
+    )
+
+    if response.status_code >= 400:
+
+        try:
+            detail = (
+                response.json()
+                .get(
+                    "detail",
+                    response.text
+                )
+            )
+        except Exception:
+            detail = response.text
+
+        raise RuntimeError(
+            f"ElevenLabs API error "
+            f"{response.status_code}: "
+            f"{detail}"
+        )
+
+    output_file.write_bytes(
+        response.content
+    )
+
+    return output_file
+
+
+# =========================================================
+# AUDIO TIMING
+# =========================================================
+
+def atempo_filter(
+    factor
+):
+
     filters = []
-    while factor < 0.5:
-        filters.append("atempo=0.5")
-        factor /= 0.5
-    while factor > 2.0:
-        filters.append("atempo=2.0")
-        factor /= 2.0
-    filters.append(f"atempo={factor:.6f}")
-    return ",".join(filters)
+
+    f = factor
+
+    while f < 0.5:
+
+        filters.append(
+            "atempo=0.5"
+        )
+
+        f /= 0.5
+
+    while f > 2.0:
+
+        filters.append(
+            "atempo=2.0"
+        )
+
+        f /= 2.0
+
+    filters.append(
+        f"atempo={f:.6f}"
+    )
+
+    return ",".join(
+        filters
+    )
 
 
-def fit_audio_to_duration(src, dst, target):
-    src_dur = max(0.05, duration_seconds(src))
-    factor = src_dur / max(0.05, target)
-    af = atempo_filter(factor)
+def fit_audio(
+    source,
+    output,
+    duration
+):
+
+    source_duration = (
+        media_duration(source)
+    )
+
+    if source_duration <= 0:
+        raise RuntimeError(
+            "TTS audio duration မမှန်ပါ။"
+        )
+
+    factor = (
+        source_duration
+        / max(duration, 0.05)
+    )
+
     run_cmd([
-        "ffmpeg", "-y", "-i", str(src), "-af", f"{af},apad", "-t", f"{target:.3f}",
-        "-ac", "1", "-ar", "48000", "-b:a", "128k", str(dst)
+        "ffmpeg",
+        "-y",
+
+        "-i",
+        str(source),
+
+        "-filter:a",
+        atempo_filter(factor),
+
+        "-t",
+        f"{duration:.3f}",
+
+        "-ac",
+        "2",
+
+        "-ar",
+        "48000",
+
+        str(output)
     ])
 
+    return output
 
-def build_dub_audio(segments, video_duration, job, progress=None):
+
+# =========================================================
+# BUILD BURMESE DUB
+# =========================================================
+
+def build_dub_audio(
+    segments,
+    video_duration,
+    job,
+    progress=None
+):
+
     clips = []
-    for i, s in enumerate(segments):
-        dur = max(0.12, min(video_duration - s["start"], s["end"] - s["start"]))
-        if dur <= 0.12:
+
+    for i, segment in enumerate(
+        segments
+    ):
+
+        duration = max(
+            0.12,
+
+            min(
+                video_duration
+                - segment["start"],
+
+                segment["end"]
+                - segment["start"]
+            )
+        )
+
+        if duration <= 0.12:
             continue
-        raw = job / f"tts_{i:04d}.mp3"
-        fitted = job / f"fit_{i:04d}.wav"
-        tts(s["translation"], raw)
-        fit_audio_to_duration(raw, fitted, dur)
-        clips.append((s["start"], fitted))
+
+        raw = (
+            job
+            / f"tts_{i:04d}.mp3"
+        )
+
+        fitted = (
+            job
+            / f"fit_{i:04d}.wav"
+        )
+
+        elevenlabs_tts(
+            segment["translation"],
+            raw
+        )
+
+        fit_audio(
+            raw,
+            fitted,
+            duration
+        )
+
+        clips.append(
+            (
+                segment["start"],
+                fitted
+            )
+        )
+
         if progress:
-            progress(0.58 + 0.25 * ((i + 1) / max(1, len(segments))), f"🗣️ Burmese voice {i+1}/{len(segments)}")
+
+            progress(
+                0.58
+                + (
+                    0.25
+                    * (i + 1)
+                    / max(
+                        1,
+                        len(segments)
+                    )
+                ),
+
+                f"🗣️ ElevenLabs "
+                f"{i + 1}/{len(segments)}"
+            )
 
     if not clips:
-        raise RuntimeError("Burmese TTS audio မထွက်ပါ။")
+
+        raise RuntimeError(
+            "Burmese TTS audio မထွက်ပါ။"
+        )
 
     inputs = []
+
     filters = []
-    for i, (start, clip) in enumerate(clips):
-        inputs += ["-i", str(clip)]
-        ms = max(0, int(start * 1000))
-        filters.append(f"[{i}:a]adelay={ms}|{ms}[a{i}]")
-    mix_inputs = "".join(f"[a{i}]" for i in range(len(clips)))
-    filters.append(f"{mix_inputs}amix=inputs={len(clips)}:duration=longest:normalize=0[dub]")
-    dub = job / "burmese_dub.wav"
-    cmd = ["ffmpeg", "-y"] + inputs + ["-filter_complex", ";".join(filters), "-map", "[dub]", "-t", f"{video_duration:.3f}", "-ac", "2", "-ar", "48000", str(dub)]
-    run_cmd(cmd)
-    return dub
 
+    for i, (
+        start,
+        clip
+    ) in enumerate(clips):
 
-def write_srt(segments, path):
-    def ts(sec):
-        sec = max(0, float(sec))
-        ms = int(round((sec - int(sec)) * 1000))
-        total = int(sec)
-        h = total // 3600
-        m = (total % 3600) // 60
-        s = total % 60
-        if ms >= 1000:
-            s += 1; ms -= 1000
-        return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
-    lines = []
-    for i, s in enumerate(segments, 1):
-        lines += [str(i), f"{ts(s['start'])} --> {ts(s['end'])}", s["translation"], ""]
-    path.write_text("\n".join(lines), encoding="utf-8")
-
-
-def mux_video(video, dub_audio, srt_path, original_volume, job, add_subtitles):
-    out = OUTPUT_DIR / f"burmese_dub_{int(time.time())}_{uuid.uuid4().hex[:6]}.mp4"
-    # Keep the original video stream untouched where possible; replace audio.
-    if add_subtitles:
-        # Soft subtitle track in MP4; players can turn it on/off.
-        cmd = [
-            "ffmpeg", "-y", "-i", str(video), "-i", str(dub_audio), "-i", str(srt_path),
-            "-filter_complex", f"[0:a]volume={float(original_volume):.3f}[orig];[orig][1:a]amix=inputs=2:duration=longest:normalize=0[a]",
-            "-map", "0:v:0", "-map", "[a]", "-map", "2:0",
-            "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-c:s", "mov_text",
-            "-metadata:s:s:0", "language=mya", "-metadata:s:s:0", "title=Burmese", str(out)
+        inputs += [
+            "-i",
+            str(clip)
         ]
+
+        delay = max(
+            0,
+            int(start * 1000)
+        )
+
+        filters.append(
+            f"[{i}:a]"
+            f"adelay={delay}|{delay}"
+            f"[a{i}]"
+        )
+
+    mix_inputs = "".join(
+        f"[a{i}]"
+        for i in range(
+            len(clips)
+        )
+    )
+
+    filters.append(
+        f"{mix_inputs}"
+        f"amix="
+        f"inputs={len(clips)}:"
+        f"duration=longest:"
+        f"normalize=0"
+        f"[dub]"
+    )
+
+    output = (
+        job
+        / "burmese_dub.wav"
+    )
+
+    run_cmd([
+        "ffmpeg",
+        "-y",
+
+        *inputs,
+
+        "-filter_complex",
+        ";".join(filters),
+
+        "-map",
+        "[dub]",
+
+        "-t",
+        f"{video_duration:.3f}",
+
+        "-ac",
+        "2",
+
+        "-ar",
+        "48000",
+
+        str(output)
+    ])
+
+    return output
+
+
+# =========================================================
+# SUBTITLES
+# =========================================================
+
+def srt_time(seconds):
+
+    seconds = max(
+        0,
+        float(seconds)
+    )
+
+    milliseconds = int(
+        round(
+            (
+                seconds
+                - int(seconds)
+            )
+            * 1000
+        )
+    )
+
+    total = int(seconds)
+
+    hours = total // 3600
+
+    minutes = (
+        total % 3600
+    ) // 60
+
+    secs = total % 60
+
+    return (
+        f"{hours:02d}:"
+        f"{minutes:02d}:"
+        f"{secs:02d},"
+        f"{milliseconds:03d}"
+    )
+
+
+def write_srt(
+    segments,
+    output
+):
+
+    with open(
+        output,
+        "w",
+        encoding="utf-8"
+    ) as f:
+
+        for i, segment in enumerate(
+            segments,
+            1
+        ):
+
+            f.write(
+                f"{i}\n"
+            )
+
+            f.write(
+                f"{srt_time(segment['start'])}"
+                f" --> "
+                f"{srt_time(segment['end'])}\n"
+            )
+
+            f.write(
+                segment[
+                    "translation"
+                ].strip()
+                + "\n\n"
+            )
+
+
+# =========================================================
+# FINAL RENDER
+# =========================================================
+
+def mux_video(
+    video,
+    dub,
+    output,
+    original_volume,
+    srt=None
+):
+
+    volume = max(
+        0,
+        min(
+            1,
+            float(original_volume)
+        )
+    )
+
+    audio_filter = (
+        f"[0:a]volume={volume:.3f}[orig];"
+        f"[1:a]volume=1.0[dub];"
+        f"[orig][dub]"
+        f"amix=inputs=2:"
+        f"duration=longest:"
+        f"normalize=0[a]"
+    )
+
+    if srt:
+
+        command = [
+            "ffmpeg",
+            "-y",
+
+            "-i",
+            str(video),
+
+            "-i",
+            str(dub),
+
+            "-i",
+            str(srt),
+
+            "-filter_complex",
+            audio_filter,
+
+            "-map",
+            "0:v:0",
+
+            "-map",
+            "[a]",
+
+            "-map",
+            "2:0",
+
+            "-c:v",
+            "copy",
+
+            "-c:a",
+            "aac",
+
+            "-b:a",
+            "192k",
+
+            "-c:s",
+            "mov_text",
+
+            "-metadata:s:s:0",
+            "language=mya",
+
+            "-metadata:s:s:0",
+            "title=Burmese",
+
+            "-shortest",
+
+            str(output)
+        ]
+
     else:
-        cmd = [
-            "ffmpeg", "-y", "-i", str(video), "-i", str(dub_audio),
-            "-filter_complex", f"[0:a]volume={float(original_volume):.3f}[orig];[orig][1:a]amix=inputs=2:duration=longest:normalize=0[a]",
-            "-map", "0:v:0", "-map", "[a]", "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", str(out)
+
+        command = [
+            "ffmpeg",
+            "-y",
+
+            "-i",
+            str(video),
+
+            "-i",
+            str(dub),
+
+            "-filter_complex",
+            audio_filter,
+
+            "-map",
+            "0:v:0",
+
+            "-map",
+            "[a]",
+
+            "-c:v",
+            "copy",
+
+            "-c:a",
+            "aac",
+
+            "-b:a",
+            "192k",
+
+            "-shortest",
+
+            str(output)
         ]
-    run_cmd(cmd)
-    return out
+
+    run_cmd(command)
+
+    return output
 
 
-def process_video(url, upload, original_volume, add_subtitles, progress=gr.Progress()):
-    if not ffmpeg_exists() or shutil.which("ffprobe") is None:
-        raise RuntimeError("ffmpeg/ffprobe မတွေ့ပါ။ Codespace terminal မှာ `sudo apt-get update && sudo apt-get install -y ffmpeg` လုပ်ပါ။")
-    if not OPENAI_API_KEY:
-        raise RuntimeError("OPENAI_API_KEY မတွေ့ပါ။ GitHub Codespaces Secrets ကို စစ်ပါ။")
-    source_upload = get_video_path(upload)
-    if not source_upload and not (url and url.strip()):
-        raise ValueError("Video URL ထည့်ပါ သို့မဟုတ် video file upload လုပ်ပါ။")
-
-    job = Path(tempfile.mkdtemp(prefix="dub_"))
-    try:
-        progress(0.02, "🚀 Job စတင်နေပါတယ်…")
-        if source_upload:
-            video = Path(source_upload)
-            if not video.exists():
-                raise RuntimeError("Uploaded video file မတွေ့ပါ။")
-            work_video = job / f"source{video.suffix.lower() or '.mp4'}"
-            shutil.copy2(video, work_video)
-        else:
-            progress(0.08, f"⬇️ {platform_name(url)} video download လုပ်နေပါတယ်…")
-            work_video = download_video(url, job)
-
-        video_dur = duration_seconds(work_video)
-        if video_dur > MAX_MINUTES * 60:
-            raise ValueError(f"Video အရှည်က {MAX_MINUTES} မိနစ် limit ထက်ပိုနေပါတယ်။")
-
-        progress(0.18, "🎧 Original audio ထုတ်နေပါတယ်…")
-        audio = extract_audio(work_video, job)
-        segments = transcribe(audio, job, progress)
-        if not segments:
-            raise RuntimeError("Speech မတွေ့ပါ။ Video ထဲမှာ စကားပြောသံရှိမရှိ စစ်ပါ။")
-
-        progress(0.40, f"📝 {len(segments)} speech segments ရပါပြီ။")
-        segments = translate_segments(segments, progress)
-        srt = job / "burmese_subtitles.srt"
-        write_srt(segments, srt)
-        dub = build_dub_audio(segments, video_dur, job, progress)
-        progress(0.87, "🎬 Burmese voice ကို video နဲ့ ပေါင်းနေပါတယ်…")
-        final = mux_video(work_video, dub, srt, float(original_volume), job, bool(add_subtitles))
-        final_srt = OUTPUT_DIR / (final.stem + ".srt")
-        shutil.copy2(srt, final_srt)
-        progress(1.0, "✅ Burmese dubbed video ပြီးပါပြီ")
-        return str(final), str(final_srt), f"✅ ပြီးပါပြီ\n\nSource: {platform_name(url) if not source_upload else 'Uploaded file'}\nDuration: {video_dur/60:.1f} min\nSpeech segments: {len(segments)}\nOriginal audio volume: {float(original_volume):.2f}"
-    except Exception:
-        raise
-    finally:
-        shutil.rmtree(job, ignore_errors=True)
-
-
-CSS = """
-.gradio-container {max-width: 1180px !important;}
-.hero {padding: 22px; border-radius: 20px; background: linear-gradient(135deg,#111827,#4f46e5); color:white; margin-bottom:16px;}
-.hero h1 {font-size: 34px; margin-bottom: 8px;}
-.note {padding:12px 14px; border-radius:12px; background:#f3f4f6;}
-"""
-
-with gr.Blocks(title="AI Burmese Video Dubbing") as app:
-    gr.HTML("""
-    <div class='hero'>
-      <h1>🎬 AI Burmese Video Dubbing</h1>
-      <div>YouTube / Facebook / TikTok public video → Detect speech → Burmese translate → Burmese voice → Final MP4</div>
-    </div>
-    """)
-
-    with gr.Tab("🎬 Video Dubbing"):
-        with gr.Row():
-            with gr.Column(scale=2):
-                url = gr.Textbox(label="Video URL", placeholder="https://www.youtube.com/... / https://www.tiktok.com/... / Facebook public video URL")
-                upload = gr.Video(label="သို့မဟုတ် Video File တိုက်ရိုက် Upload", sources=["upload"])
-                gr.Markdown("**Public video ကိုသာ URL နဲ့ download လုပ်ပါတယ်။** Site တစ်ခုချင်းစီရဲ့ anti-bot/login restriction ကြောင့် URL တချို့ မရနိုင်ပါ။")
-            with gr.Column(scale=1):
-                original_volume = gr.Slider(0, 1, value=0.18, step=0.02, label="Original audio volume")
-                add_subtitles = gr.Checkbox(value=True, label="Burmese subtitles ထည့်မယ်")
-                start = gr.Button("🚀 Translate & Dub to Burmese", variant="primary", size="lg")
-
-        status = gr.Textbox(label="Status", lines=7)
-        with gr.Row():
-            result = gr.Video(label="🎞️ Final Burmese Dubbed Video")
-            srt_file = gr.File(label="📄 Burmese SRT")
-
-        start.click(process_video, [url, upload, original_volume, add_subtitles], [result, srt_file, status])
-
-    with gr.Tab("ℹ️ How it works"):
-        gr.Markdown("""
-### Pipeline
-1. Video URL ကို download (သို့) upload file ကိုယူမယ်
-2. Audio ကို extract လုပ်မယ်
-3. Speech language ကို AI နဲ့ detect/transcribe လုပ်မယ်
-4. စကားပြောစာသားကို သဘာဝကျ Burmese ပြန်ဆိုမယ်
-5. Burmese TTS အသံထုတ်မယ်
-6. Original audio ကို လျှော့ပြီး Burmese voice ကို mix လုပ်မယ်
-7. Burmese subtitle track + SRT ထုတ်မယ်
-8. Final MP4 ပြန်ပေးမယ်
-
-**မှတ်ချက်:** ဒီ version က original speech ကို AI voice-isolation နဲ့ 100% ဖယ်ရှားတာမဟုတ်ဘဲ original audio ကို လျှော့ပြီး Burmese voice ကို အပေါ်ကနေ mix လုပ်ပါတယ်။ Music/background sound ကို တတ်နိုင်သမျှ ထိန်းထားဖို့ ဒီနည်းကိုသုံးထားပါတယ်။
-        """)
-
-if __name__ == "__main__":
-    app.queue().launch(server_name="0.0.0.0", server_port=int(os.getenv("PORT", "7860")), css=CSS, theme=gr.themes.Soft())
+# =========================================================
+# MAIN PIPELINE
+# =================
